@@ -125,8 +125,8 @@ class SortHubApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Sort Hub - Сортувальник файлів")
-        self.geometry("650x500")
-        self.minsize(650, 500)
+        self.geometry("650x650")  # Увеличиваем высоту окна с 500 до 650
+        self.minsize(650, 650)  # Также увеличиваем минимальный размер
         
         self.source_folder = None
         self.dest_folder = None
@@ -158,50 +158,53 @@ class SortHubApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
-        # Main frame
+        # Main frame с отступами
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Source directory selection
-        ttk.Label(main_frame, text="Яку директорію ви бажаєте відсортувати?", font=("", 12)).pack(pady=(10, 5), anchor=tk.W)
+        # ________________________________________________
+        # 1. Заголовок выбора исходной директории
+        ttk.Label(main_frame, text="Яку директорію ви бажаєте відсортувати?", font=("", 12)).pack(pady=(5, 5), anchor=tk.W)
         
+        # 2. Выбор исходной директории
         dir_frame = ttk.Frame(main_frame)
         dir_frame.pack(fill=tk.X, pady=5)
         
         self.source_entry = ttk.Entry(dir_frame)
-        self.source_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.source_entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
         
-        ttk.Button(dir_frame, text="Обрати...", command=self.select_source_dir).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(dir_frame, text="Обрати...", command=self.select_source_dir).pack(side=tk.LEFT, padx=5)
         
-        # Destination directory selection
-        ttk.Label(main_frame, text="Куди зберегти відсортовані файли?", font=("", 12)).pack(pady=(10, 5), anchor=tk.W)
-        
-        dest_frame = ttk.Frame(main_frame)
-        dest_frame.pack(fill=tk.X, pady=5)
-        
-        self.dest_entry = ttk.Entry(dest_frame)
-        self.dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        ttk.Button(dest_frame, text="Обрати...", command=self.select_dest_dir).pack(side=tk.RIGHT, padx=5)
-        
-        # Recursive checkbox and analyze button row
+        # ________________________________________________
+        # 3. Галочка рекурсивного анализа и кнопка анализа
         options_frame = ttk.Frame(main_frame)
         options_frame.pack(fill=tk.X, pady=5)
         
+        ttk.Button(options_frame, text="Аналіз", command=self.analyze_directory).pack(side=tk.LEFT, padx=5)
+        
         ttk.Checkbutton(
             options_frame, 
-            text="Проаналізувати по всім директоріям в цій директорії",
+            text="Проаналізувати по всім директоріям з цього рівня",
             variable=self.recursive_var
         ).pack(side=tk.LEFT)
         
-        ttk.Button(options_frame, text="Проаналізувати директорію", command=self.analyze_directory).pack(side=tk.RIGHT, padx=5)
         
-        # Extensions frame (will be populated after directory analysis)
+        # ________________________________________________
+        # 4. Кнопки выбора всех/отмены всех форматов
+        select_buttons_frame = ttk.Frame(main_frame)
+        select_buttons_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(select_buttons_frame, text="Вибрати всі формати", command=self.select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(select_buttons_frame, text="Зняти всі формати", command=self.select_none).pack(side=tk.LEFT, padx=5)
+        
+        # ________________________________________________
+        # 5. Окно с найденными форматами
+        # Рамка с форматами файлов
         self.extensions_frame = ttk.LabelFrame(main_frame, text="Знайдені формати файлів", padding="10")
         self.extensions_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        # Scrollable frame for extensions
-        self.canvas = tk.Canvas(self.extensions_frame, height=120)
+        # Прокручиваемое окно для форматов
+        self.canvas = tk.Canvas(self.extensions_frame, height=180)  # Увеличиваем высоту с 120 до 180
         scrollbar = ttk.Scrollbar(self.extensions_frame, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = ttk.Frame(self.canvas)
         
@@ -218,7 +221,7 @@ class SortHubApp(tk.Tk):
         def _on_mousewheel(event):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
             
-        # Привязываем обработчики только к canvas, а не ко всем виджетам
+        # Привязываем обработчики только к canvas
         self.canvas.bind("<MouseWheel>", _on_mousewheel)
         self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
         self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
@@ -226,19 +229,51 @@ class SortHubApp(tk.Tk):
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # Status label
+        # ________________________________________________
+        # 6. Информация о количестве файлов и их объеме
+        self.files_info_frame = ttk.Frame(main_frame)
+        self.files_info_frame.pack(fill=tk.X, pady=5)
+        
+        self.files_count_label = ttk.Label(self.files_info_frame, text="Кількість файлів: 0", font=("", 10))
+        self.files_count_label.pack(side=tk.LEFT, padx=5)
+        
+        self.files_size_label = ttk.Label(self.files_info_frame, text="Загальний об'єм: 0 байт", font=("", 10))
+        self.files_size_label.pack(side=tk.RIGHT, padx=5)
+        
+        # ________________________________________________
+        # 7. Заголовок выбора директории назначения
+        ttk.Label(main_frame, text="Куди зберегти відсортовані файли?", font=("", 12)).pack(pady=(5, 5), anchor=tk.W)
+        
+        # 8. Выбор директории назначения
+        dest_frame = ttk.Frame(main_frame)
+        dest_frame.pack(fill=tk.X, pady=5)
+        
+        self.dest_entry = ttk.Entry(dest_frame)
+        self.dest_entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        
+        ttk.Button(dest_frame, text="Обрати...", command=self.select_dest_dir).pack(side=tk.LEFT, padx=5)
+        
+        # ________________________________________________
+        # 9. Лог состояния и прогресс-бар
         self.status_label = ttk.Label(main_frame, text="Оберіть директорію для початку", font=("", 10))
         self.status_label.pack(pady=5, anchor=tk.W)
         
-        # Control buttons
+        # Добавляем прогресс-бар
+        self.progress_frame = ttk.Frame(main_frame)
+        self.progress_frame.pack(fill=tk.X, pady=5)
+        
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient="horizontal", length=100, mode="determinate")
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        self.progress_label = ttk.Label(self.progress_frame, text="0%")
+        self.progress_label.pack(side=tk.RIGHT)
+        
+        # ________________________________________________
+        # 10. Кнопки управления сортировкой
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=10)
         
-        # Select all/none buttons
-        ttk.Button(button_frame, text="Вибрати все", command=self.select_all).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Скасувати все", command=self.select_none).pack(side=tk.LEFT, padx=5)
-        
-        # Cancel button (initially disabled)
+        # Кнопка отмены
         self.cancel_button = ttk.Button(
             button_frame, 
             text="Зупинити процес", 
@@ -247,7 +282,7 @@ class SortHubApp(tk.Tk):
         )
         self.cancel_button.pack(side=tk.RIGHT, padx=5)
         
-        # Sorting buttons
+        # Кнопки сортировки
         self.move_button = ttk.Button(
             button_frame, 
             text="Почати сортування переносом", 
@@ -396,7 +431,9 @@ class SortHubApp(tk.Tk):
             frame = ttk.Frame(self.scrollable_frame)
             frame.pack(fill=tk.X, expand=True, pady=2)
             
-            ttk.Checkbutton(frame, variable=var).pack(side=tk.LEFT)
+            # Добавляем отслеживание изменения состояния чекбокса
+            cb = ttk.Checkbutton(frame, variable=var, command=self.update_selected_files_count)
+            cb.pack(side=tk.LEFT)
             
             if ext == 'folders':
                 ttk.Label(frame, text=f"Папки ({count} шт.)").pack(side=tk.LEFT, padx=5)
@@ -406,6 +443,41 @@ class SortHubApp(tk.Tk):
         # Включаем кнопки сортировки
         self.move_button.config(state=tk.NORMAL)
         self.copy_button.config(state=tk.NORMAL)
+        
+        # Инициализируем счетчики
+        self.update_selected_files_count()
+    
+    def update_selected_files_count(self):
+        """
+        Обновляет количество выбранных файлов и их общий объем
+        """
+        selected_files_count = 0
+        selected_files_size = 0
+        
+        for file in self.files:
+            ext = file.suffix.lower()[1:] or 'no_extension'
+            if ext in self.extension_vars and self.extension_vars.get(ext).get():
+                selected_files_count += 1
+                selected_files_size += file.stat().st_size
+        
+        # Форматируем размер для более удобного отображения
+        size_str = self.format_file_size(selected_files_size)
+        
+        self.files_count_label.config(text=f"Кількість файлів: {selected_files_count}")
+        self.files_size_label.config(text=f"Загальний об'єм: {size_str}")
+        
+    def format_file_size(self, size_in_bytes):
+        """
+        Форматирует размер файла для отображения в удобном виде
+        """
+        if size_in_bytes < 1024:
+            return f"{size_in_bytes} байт"
+        elif size_in_bytes < 1024 * 1024:
+            return f"{size_in_bytes / 1024:.2f} КБ"
+        elif size_in_bytes < 1024 * 1024 * 1024:
+            return f"{size_in_bytes / (1024 * 1024):.2f} МБ"
+        else:
+            return f"{size_in_bytes / (1024 * 1024 * 1024):.2f} ГБ"
     
     def select_all(self):
         """
@@ -413,6 +485,7 @@ class SortHubApp(tk.Tk):
         """
         for var in self.extension_vars.values():
             var.set(True)
+        self.update_selected_files_count()
     
     def select_none(self):
         """
@@ -420,6 +493,7 @@ class SortHubApp(tk.Tk):
         """
         for var in self.extension_vars.values():
             var.set(False)
+        self.update_selected_files_count()
     
     def start_sorting(self, operation='move'):
         """
@@ -504,11 +578,29 @@ class SortHubApp(tk.Tk):
                 })
                 return
             
+            # Рассчитываем общее количество файлов и папок для обработки
+            total_items = 0
+            for file in files:
+                ext = file.suffix.lower()[1:] or 'no_extension'
+                # Учитываем только файлы с выбранными расширениями
+                if ext in selected_extensions:
+                    total_items += 1
+            
+            # Добавляем папки, если они выбраны
+            if has_folders and 'folders' in selected_extensions:
+                total_items += len(folders)
+            
+            # Инициализируем счетчик обработанных элементов
+            processed_items = 0
+            
+            # Обновляем прогресс-бар до 0
+            self.after(0, lambda: self._update_progress(0, 0, total_items))
+            
             # Обрабатываем файлы
             for file in files:
                 if self.should_cancel:
                     logger.info("Sorting process was cancelled by the user.")
-                    break
+                    return  # Заменяем break на return, так как break некорректен вне цикла
                     
                 ext = file.suffix.lower()[1:] or 'no_extension'
                 # Обрабатываем только файлы с выбранными расширениями
@@ -517,13 +609,19 @@ class SortHubApp(tk.Tk):
                         await self._move_file_async(file, self.dest_folder)
                     else:
                         await self._copy_file_async(file, self.dest_folder)
+                    
+                    # Увеличиваем счетчик и обновляем прогресс
+                    processed_items += 1
+                    progress_percent = int(100 * processed_items / total_items) if total_items > 0 else 0
+                    self.after(0, lambda p=processed_items, t=total_items, pp=progress_percent: 
+                               self._update_progress(pp, p, t))
             
             # Обрабатываем папки если выбраны
             if has_folders and 'folders' in selected_extensions:
                 for folder in folders:
                     if self.should_cancel:
                         logger.info("Sorting process was cancelled by the user.")
-                        break
+                        return  # Заменяем break на return, так как break некорректен вне цикла
                         
                     # Пропускаем папки, которые могут вызвать рекурсию
                     if str(self.dest_folder).startswith(str(folder)):
@@ -534,6 +632,12 @@ class SortHubApp(tk.Tk):
                         await self._move_folder_async(folder, self.dest_folder)
                     else:
                         await self._copy_folder_async(folder, self.dest_folder)
+                    
+                    # Увеличиваем счетчик и обновляем прогресс
+                    processed_items += 1
+                    progress_percent = int(100 * processed_items / total_items) if total_items > 0 else 0
+                    self.after(0, lambda p=processed_items, t=total_items, pp=progress_percent: 
+                               self._update_progress(pp, p, t))
 
             # Если есть накопленные конфликты, обрабатываем их
             if self.pending_conflicts and not self.should_cancel:
@@ -557,7 +661,15 @@ class SortHubApp(tk.Tk):
         finally:
             # Гарантированно сбрасываем состояние сортировки
             self.after(0, self._reset_sorting_state)
-            
+    
+    def _update_progress(self, percent, processed, total):
+        """
+        Обновляет прогресс-бар и текст прогресса
+        """
+        self.progress_bar['value'] = percent
+        # Изменяем формат отображения прогресса, чтобы показывать количество обработанных файлов
+        self.progress_label.config(text=f"{percent}% (оброблено {processed} з {total})")
+    
     async def process_pending_conflicts(self):
         """
         Обрабатывает накопленные конфликты файлов
@@ -620,9 +732,10 @@ class SortHubApp(tk.Tk):
                             else:
                                 await asyncio.to_thread(shutil.copy2, source_file, new_path)
                                 logger.info(f"Copied {source_file.name} to {new_path}")
+                            break
                         except Exception as e:
                             logger.error(f"Error during {operation} for {source_file.name}: {str(e)}")
-                        break
+                            break
                     counter += 1
     
     async def resolve_conflict_with_counter(self, source_path, dest_path, is_file=True, current=1, total=1):
