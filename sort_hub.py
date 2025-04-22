@@ -693,8 +693,14 @@ class SortHubApp(tk.Tk):
         msg = f'{entity_type} "{source_path.name}" вже існує у папці призначення.'
         ttk.Label(frame, text=msg, wraplength=400).pack(pady=(0, 10))
         
+        # Добавляем радиокнопки в зависимости от типа объекта
         ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
         ttk.Radiobutton(frame, text="Замінити існуючий", variable=action_var, value="replace").pack(anchor=tk.W)
+        
+        # Добавляем опцию "Об'єднати" только для директорий
+        if not is_file:
+            ttk.Radiobutton(frame, text="Об'єднати", variable=action_var, value="merge").pack(anchor=tk.W)
+            
         ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
         
         apply_text = "Застосувати до всіх конфліктів " + ("файлів" if is_file else "папок") 
@@ -967,8 +973,17 @@ class SortHubApp(tk.Tk):
             
             # Проверяем конфликт имен папок
             if await asyncio.to_thread(dest_path.exists):
-                # Получаем решение пользователя о конфликте
-                resolution = await self.resolve_conflict(source_folder, dest_path, False)
+                # Проверяем, есть ли уже глобальное решение для всех папок
+                global APPLY_TO_ALL_FOLDERS, FOLDER_CONFLICT_ACTION
+                if APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
+                    logger.info(f"Using saved folder conflict action: {FOLDER_CONFLICT_ACTION}")
+                    resolution = FOLDER_CONFLICT_ACTION
+                else:
+                    # Добавляем в список ожидающих разрешения конфликтов
+                    logger.info(f"Adding folder conflict for {source_folder.name} to pending list")
+                    self.pending_conflicts.append((source_folder, dest_path, False))
+                    self.pending_operations.append('move')
+                    return
                 
                 if resolution == "skip":
                     logger.info(f"Skipped moving folder {source_folder.name}")
@@ -977,6 +992,10 @@ class SortHubApp(tk.Tk):
                     # Если нужно заменить существующую папку
                     if await asyncio.to_thread(dest_path.exists) and dest_path != source_folder:
                         await asyncio.to_thread(shutil.rmtree, dest_path)
+                elif resolution == "merge":
+                    # Для слияния папок - не делаем ничего особенного здесь,
+                    # т.к. shutil.move будет объединять содержимое
+                    logger.info(f"Merging folder {source_folder.name} with existing folder")
                 else:  # rename
                     # Для переименования создаем новый путь с суффиксом
                     counter = 1
@@ -1027,8 +1046,17 @@ class SortHubApp(tk.Tk):
             
             # Проверяем конфликт имен папок
             if await asyncio.to_thread(dest_path.exists):
-                # Получаем решение пользователя о конфликте
-                resolution = await self.resolve_conflict(source_folder, dest_path, False)
+                # Проверяем, есть ли уже глобальное решение для всех папок
+                global APPLY_TO_ALL_FOLDERS, FOLDER_CONFLICT_ACTION
+                if APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
+                    logger.info(f"Using saved folder conflict action: {FOLDER_CONFLICT_ACTION}")
+                    resolution = FOLDER_CONFLICT_ACTION
+                else:
+                    # Добавляем в список ожидающих разрешения конфликтов
+                    logger.info(f"Adding folder conflict for {source_folder.name} to pending list")
+                    self.pending_conflicts.append((source_folder, dest_path, False))
+                    self.pending_operations.append('copy')
+                    return
                 
                 if resolution == "skip":
                     logger.info(f"Skipped copying folder {source_folder.name}")
@@ -1037,6 +1065,34 @@ class SortHubApp(tk.Tk):
                     # Если нужно заменить существующую папку
                     if await asyncio.to_thread(dest_path.exists):
                         await asyncio.to_thread(shutil.rmtree, dest_path)
+                elif resolution == "merge":
+                    # При слиянии папок копируем содержимое папки-источника в папку назначения
+                    logger.info(f"Merging folder {source_folder.name} with existing folder")
+                    
+                    # Получаем список файлов и папок в исходной директории
+                    for item in source_folder.iterdir():
+                        dest_item = dest_path / item.name
+                        
+                        if item.is_file():
+                            # Копируем файл, если его еще нет или если он отличается
+                            if not dest_item.exists() or not await self._is_same_file(item, dest_item):
+                                await asyncio.to_thread(shutil.copy2, item, dest_item)
+                        elif item.is_dir():
+                            # Для директорий рекурсивно копируем, создавая при необходимости
+                            if not dest_item.exists():
+                                await asyncio.to_thread(shutil.copytree, item, dest_item)
+                            else:
+                                # Копируем содержимое папки
+                                for sub_item in item.iterdir():
+                                    dest_sub_item = dest_item / sub_item.name
+                                    if sub_item.is_file():
+                                        if not dest_sub_item.exists() or not await self._is_same_file(sub_item, dest_sub_item):
+                                            await asyncio.to_thread(shutil.copy2, sub_item, dest_sub_item)
+                                    elif sub_item.is_dir() and not dest_sub_item.exists():
+                                        await asyncio.to_thread(shutil.copytree, sub_item, dest_sub_item)
+                    
+                    # После слияния прекращаем обработку, так как содержимое уже скопировано
+                    return
                 else:  # rename
                     # Для переименования создаем новый путь с суффиксом
                     counter = 1
@@ -1125,6 +1181,7 @@ class SortHubApp(tk.Tk):
         
         ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
         ttk.Radiobutton(frame, text="Замінити існуючий", variable=action_var, value="replace").pack(anchor=tk.W)
+        ttk.Radiobutton(frame, text="Об'єднати", variable=action_var, value="merge").pack(anchor=tk.W)
         ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
         
         apply_text = "Застосувати до всіх конфліктів " + ("файлів" if is_file else "папок") 
