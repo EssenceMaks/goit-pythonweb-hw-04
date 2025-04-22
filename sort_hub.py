@@ -225,6 +225,15 @@ class SortHubApp(tk.Tk):
         ttk.Button(button_frame, text="Вибрати все", command=self.select_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Скасувати все", command=self.select_none).pack(side=tk.LEFT, padx=5)
         
+        # Cancel button (initially disabled)
+        self.cancel_button = ttk.Button(
+            button_frame, 
+            text="Зупинити процес", 
+            command=self.cancel_sorting,
+            state=tk.DISABLED
+        )
+        self.cancel_button.pack(side=tk.RIGHT, padx=5)
+        
         # Sorting buttons
         self.move_button = ttk.Button(
             button_frame, 
@@ -241,7 +250,11 @@ class SortHubApp(tk.Tk):
             state=tk.DISABLED
         )
         self.copy_button.pack(side=tk.RIGHT, padx=5)
-    
+        
+        # Флаг для отслеживания процесса сортировки
+        self.is_sorting = False
+        self.should_cancel = False
+
     def check_async_messages(self):
         """
         Проверяет сообщения от асинхронных функций
@@ -256,7 +269,6 @@ class SortHubApp(tk.Tk):
                     
                 elif action == 'show_completion':
                     self._show_completion_dialog(message.get('operation', ''))
-                    self._enable_buttons()
                     
                 elif action == 'show_error':
                     messagebox.showerror("Помилка", message.get('error', 'Невідома помилка'))
@@ -275,12 +287,18 @@ class SortHubApp(tk.Tk):
                     dest_path = message.get('dest_path', '')
                     future = message.get('future')
                     
-                    if future:
-                        if is_file:
-                            result = self._handle_file_conflict_sync(Path(source_path), Path(dest_path))
-                        else:
-                            result = self._handle_folder_conflict_sync(Path(source_path), Path(dest_path))
-                        future.set_result(result)
+                    if future and not future.done():  # Проверяем, не завершен ли уже future
+                        try:
+                            if is_file:
+                                result = self._handle_file_conflict_sync(Path(source_path), Path(dest_path))
+                            else:
+                                result = self._handle_folder_conflict_sync(Path(source_path), Path(dest_path))
+                            if not future.done():  # Проверяем еще раз перед установкой результата
+                                future.set_result(result)
+                        except Exception as e:
+                            logger.error(f"Error handling conflict resolution: {str(e)}")
+                            if not future.done():
+                                future.set_result("skip")  # В случае ошибки пропускаем файл
                 
         except queue.Empty:
             pass
@@ -451,6 +469,7 @@ class SortHubApp(tk.Tk):
         self.status_label.config(text=f"Сортування файлів ({action_name})...")
         self.move_button.config(state=tk.DISABLED)
         self.copy_button.config(state=tk.DISABLED)
+        self.cancel_button.config(state=tk.NORMAL)
         self.update()
         
         # Сбрасываем глобальные настройки разрешения конфликтов
@@ -459,6 +478,10 @@ class SortHubApp(tk.Tk):
         FOLDER_CONFLICT_ACTION = None
         APPLY_TO_ALL_FILES = False
         APPLY_TO_ALL_FOLDERS = False
+        
+        # Устанавливаем флаги сортировки
+        self.is_sorting = True
+        self.should_cancel = False
         
         # Запускаем асинхронную сортировку
         run_in_background(self._run_sorting_async)(
@@ -473,6 +496,10 @@ class SortHubApp(tk.Tk):
         Запускает асинхронную сортировку файлов
         """
         try:
+            # Устанавливаем флаг начала сортировки
+            # Этот вызов должен выполняться в GUI-потоке
+            self.after(0, lambda: self._update_sorting_status(True))
+            
             # Создаем целевую папку, если она не существует
             os.makedirs(self.dest_folder, exist_ok=True)
             
@@ -492,6 +519,9 @@ class SortHubApp(tk.Tk):
             
             # Обрабатываем файлы
             for file in files:
+                if self.should_cancel:
+                    logger.info("Sorting process was cancelled by the user.")
+                    break
                 ext = file.suffix.lower()[1:] or 'no_extension'
                 # Обрабатываем только файлы с выбранными расширениями
                 if ext in selected_extensions:
@@ -503,6 +533,9 @@ class SortHubApp(tk.Tk):
             # Обрабатываем папки если выбраны
             if has_folders and 'folders' in selected_extensions:
                 for folder in folders:
+                    if self.should_cancel:
+                        logger.info("Sorting process was cancelled by the user.")
+                        break
                     # Пропускаем папки, которые могут вызвать рекурсию
                     if str(self.dest_folder).startswith(str(folder)):
                         logger.warning(f"Skipping folder {folder.name} to avoid recursion")
@@ -514,11 +547,12 @@ class SortHubApp(tk.Tk):
                         await self._copy_folder_async(folder, self.dest_folder)
             
             # Показываем информацию о завершении
-            action_name = "переміщено" if operation == 'move' else "скопійовано"
-            async_gui_queue.put({
-                'action': 'show_completion',
-                'operation': action_name
-            })
+            if not self.should_cancel:
+                action_name = "переміщено" if operation == 'move' else "скопійовано"
+                async_gui_queue.put({
+                    'action': 'show_completion',
+                    'operation': action_name
+                })
             
         except Exception as e:
             logger.error(f"Error during sorting: {str(e)}")
@@ -526,6 +560,52 @@ class SortHubApp(tk.Tk):
                 'action': 'show_error',
                 'error': f"Помилка під час сортування: {str(e)}"
             })
+        finally:
+            # Гарантированно сбрасываем состояние сортировки при любом исходе
+            # Этот вызов должен выполняться в GUI-потоке
+            self.after(0, lambda: self._update_sorting_status(False))
+            
+    def _update_sorting_status(self, is_active):
+        """
+        Обновляет состояние интерфейса во время сортировки
+        """
+        self.is_sorting = is_active
+        if is_active:
+            self.move_button.config(state=tk.DISABLED)
+            self.copy_button.config(state=tk.DISABLED)
+            self.cancel_button.config(state=tk.NORMAL)
+        else:
+            self.move_button.config(state=tk.NORMAL)
+            self.copy_button.config(state=tk.NORMAL)
+            self.cancel_button.config(state=tk.DISABLED)
+            if not self.should_cancel:
+                # Если процесс не был отменен пользователем, обновляем статус
+                self.status_label.config(text="Сортування завершено")
+            else:
+                self.should_cancel = False  # Сбрасываем флаг отмены
+    
+    def cancel_sorting(self):
+        """
+        Прерывает процесс сортировки
+        """
+        if self.is_sorting:
+            self.should_cancel = True
+            self.status_label.config(text="Сортування зупинено користувачем.")
+            # Разблокируем кнопки сортировки
+            self._enable_buttons()
+            # Заблокируем кнопку отмены
+            self.cancel_button.config(state=tk.DISABLED)
+            
+            # Сообщение пользователю
+            messagebox.showinfo("Інформація", "Процес сортування буде зупинено після завершення поточної операції.")
+    
+    def _enable_buttons(self):
+        """
+        Включает кнопки сортировки
+        """
+        self.move_button.config(state=tk.NORMAL)
+        self.copy_button.config(state=tk.NORMAL)
+        self.is_sorting = False
     
     def on_closing(self):
         """
@@ -773,35 +853,43 @@ class SortHubApp(tk.Tk):
         
         # Проверяем, есть ли уже решение для всех файлов/папок
         if is_file and APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
-            action = FILE_CONFLICT_ACTION
+            logger.info(f"Using saved file conflict resolution for {source_path.name}: {FILE_CONFLICT_ACTION}")
+            return FILE_CONFLICT_ACTION
         elif not is_file and APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
-            action = FOLDER_CONFLICT_ACTION
-        else:
-            # Отправляем запрос в GUI поток через очередь сообщений
-            future = asyncio.Future()
-            request_data = {
-                'action': 'request_resolution',
-                'is_file': is_file,
-                'source_path': str(source_path),
-                'dest_path': str(dest_path),
-                'future': future
-            }
-            
-            # Добавляем в очередь сообщений для обработки в основном потоке
-            async_gui_queue.put(request_data)
-            
-            # Ждем результата от GUI потока
-            try:
-                action = await asyncio.wait_for(future, timeout=60.0)
-            except asyncio.TimeoutError:
-                logger.error("Timeout waiting for conflict resolution")
-                return "skip"
-            
-            # Сохраняем действие для всех файлов/папок, если указано
-            if is_file and APPLY_TO_ALL_FILES:
-                FILE_CONFLICT_ACTION = action
-            elif not is_file and APPLY_TO_ALL_FOLDERS:
-                FOLDER_CONFLICT_ACTION = action
+            logger.info(f"Using saved folder conflict resolution for {source_path.name}: {FOLDER_CONFLICT_ACTION}")
+            return FOLDER_CONFLICT_ACTION
+        
+        # Отправляем запрос в GUI поток через очередь сообщений
+        future = asyncio.Future()
+        request_data = {
+            'action': 'request_resolution',
+            'is_file': is_file,
+            'source_path': str(source_path),
+            'dest_path': str(dest_path),
+            'future': future,
+            'priority': True  # Помечаем как приоритетное сообщение
+        }
+        
+        # Добавляем в очередь сообщений для обработки в основном потоке
+        async_gui_queue.put(request_data)
+        
+        # Ждем результата от GUI потока
+        try:
+            action = await asyncio.wait_for(future, timeout=10.0)  # Увеличиваем таймаут до 10 секунд
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout waiting for conflict resolution for {source_path.name}")
+            return "skip"
+        except Exception as e:
+            logger.error(f"Error during conflict resolution for {source_path.name}: {str(e)}")
+            return "skip"
+        
+        # Сохраняем действие для всех файлов/папок, если указано
+        if is_file and APPLY_TO_ALL_FILES:
+            FILE_CONFLICT_ACTION = action
+            logger.info(f"Saved file conflict action for all files: {action}")
+        elif not is_file and APPLY_TO_ALL_FOLDERS:
+            FOLDER_CONFLICT_ACTION = action
+            logger.info(f"Saved folder conflict action for all folders: {action}")
         
         logger.info(f"Conflict resolution for {source_path.name}: {action}")
         return action
@@ -865,13 +953,18 @@ class SortHubApp(tk.Tk):
                 if APPLY_TO_ALL_FILES:
                     FILE_CONFLICT_ACTION = result["action"]
                 dialog.destroy()
+                
+            def on_cancel():
+                result["action"] = "skip"
+                dialog.destroy()
             
             btn_frame = ttk.Frame(frame)
             btn_frame.pack(fill=tk.X, pady=10)
             
+            ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
             ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
             
-            dialog.protocol("WM_DELETE_WINDOW", on_ok)
+            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
             
             # Центрируем диалог
             dialog.update_idletasks()
@@ -891,20 +984,9 @@ class SortHubApp(tk.Tk):
             action = result["action"]
         
         if action == "replace":
-            return str(dest_path)
+            return "replace"
         elif action == "rename":
-            # Создаем уникальное имя, добавляя номер
-            counter = 1
-            stem = dest_path.stem
-            suffix = dest_path.suffix
-            parent = dest_path.parent
-            
-            while True:
-                new_name = f"{stem}_{counter}{suffix}"
-                new_path = parent / new_name
-                if not new_path.exists():
-                    return str(new_path)
-                counter += 1
+            return "rename"
         else:  # skip
             return "skip"
     
@@ -948,13 +1030,18 @@ class SortHubApp(tk.Tk):
                 if APPLY_TO_ALL_FOLDERS:
                     FOLDER_CONFLICT_ACTION = result["action"]
                 dialog.destroy()
+                
+            def on_cancel():
+                result["action"] = "skip"
+                dialog.destroy()
             
             btn_frame = ttk.Frame(frame)
             btn_frame.pack(fill=tk.X, pady=10)
             
+            ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
             ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
             
-            dialog.protocol("WM_DELETE_WINDOW", on_ok)
+            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
             
             # Центрируем диалог
             dialog.update_idletasks()
@@ -974,19 +1061,9 @@ class SortHubApp(tk.Tk):
             action = result["action"]
         
         if action == "replace":
-            return str(dest_path)
+            return "replace"
         elif action == "rename":
-            # Создаем уникальное имя, добавляя номер
-            counter = 1
-            name = dest_path.name
-            parent = dest_path.parent
-            
-            while True:
-                new_name = f"{name}_{counter}"
-                new_path = parent / new_name
-                if not new_path.exists():
-                    return str(new_path)
-                counter += 1
+            return "rename"
         else:  # skip
             return "skip"
     
@@ -1002,17 +1079,15 @@ class SortHubApp(tk.Tk):
         """
         pass
     
-    def _enable_buttons(self):
-        """
-        Включает кнопки сортировки
-        """
-        self.move_button.config(state=tk.NORMAL)
-        self.copy_button.config(state=tk.NORMAL)
-    
     def _show_completion_dialog(self, action_name):
         """
         Показывает диалог завершения
         """
+        if self.should_cancel:
+            self.status_label.config(text="Сортування зупинено користувачем.")
+            self._enable_buttons()
+            return
+            
         self.status_label.config(text=f"Сортування завершено. Файли {action_name}.")
         
         completion_window = tk.Toplevel(self)
@@ -1020,6 +1095,7 @@ class SortHubApp(tk.Tk):
         completion_window.geometry("300x150")
         completion_window.resizable(False, False)
         completion_window.transient(self)
+        completion_window.grab_set()  # Блокируем взаимодействие с основным окном
         
         frame = ttk.Frame(completion_window, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -1045,6 +1121,7 @@ class SortHubApp(tk.Tk):
             command=completion_window.destroy
         ).pack(side=tk.RIGHT, padx=5)
         
+        # Центрирование окна
         completion_window.update_idletasks()
         width = completion_window.winfo_width()
         height = completion_window.winfo_height()
@@ -1052,6 +1129,11 @@ class SortHubApp(tk.Tk):
         y = (completion_window.winfo_screenheight() // 2) - (height // 2)
         completion_window.geometry(f'+{x}+{y}')
         
+        # Поднимаем диалог на передний план
+        completion_window.lift()
+        completion_window.focus_force()
+        
+        # Включаем кнопки сортировки
         self._enable_buttons()
     
     def _open_dest_folder(self):
