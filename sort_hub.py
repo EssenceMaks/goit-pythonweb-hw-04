@@ -144,6 +144,11 @@ class SortHubApp(tk.Tk):
         self.conflict_result = None
         self.conflict_resolved = threading.Event()
         
+        # Накопленные конфликты
+        self.pending_conflicts = []  # Список файлов, ожидающих разрешения конфликта
+        self.pending_operations = []  # Список операций для конфликтующих файлов (move/copy)
+        self.current_operation = None  # Текущая операция (move/copy)
+        
         self.create_widgets()
         
         # Запускаем проверку очереди сообщений
@@ -477,6 +482,11 @@ class SortHubApp(tk.Tk):
         Запускает асинхронную сортировку файлов
         """
         try:
+            # Очищаем предыдущий список конфликтов
+            self.pending_conflicts = []
+            self.pending_operations = []
+            self.current_operation = operation
+            
             # Создаем целевую папку, если она не существует
             os.makedirs(self.dest_folder, exist_ok=True)
             
@@ -524,6 +534,11 @@ class SortHubApp(tk.Tk):
                         await self._move_folder_async(folder, self.dest_folder)
                     else:
                         await self._copy_folder_async(folder, self.dest_folder)
+
+            # Если есть накопленные конфликты, обрабатываем их
+            if self.pending_conflicts and not self.should_cancel:
+                self.status_label.config(text=f"Обробка конфліктів файлів ({len(self.pending_conflicts)} шт.)...")
+                await self.process_pending_conflicts()
             
             # Показываем информацию о завершении
             if not self.should_cancel:
@@ -543,6 +558,200 @@ class SortHubApp(tk.Tk):
             # Гарантированно сбрасываем состояние сортировки
             self.after(0, self._reset_sorting_state)
             
+    async def process_pending_conflicts(self):
+        """
+        Обрабатывает накопленные конфликты файлов
+        """
+        if not self.pending_conflicts:
+            return
+            
+        # Показываем общее количество конфликтов
+        total_conflicts = len(self.pending_conflicts)
+        self.status_label.config(text=f"Виявлено {total_conflicts} конфліктів файлів. Очікування рішення...")
+        
+        # Обрабатываем каждый конфликт
+        for i, (source_file, dest_path, is_file) in enumerate(self.pending_conflicts):
+            if self.should_cancel:
+                logger.info("Conflict resolution was cancelled by the user.")
+                break
+                
+            # Обновляем статус
+            self.status_label.config(text=f"Виконання конфлікту {i+1} з {total_conflicts}...")
+            
+            # Получаем решение от пользователя
+            operation = self.pending_operations[i] if i < len(self.pending_operations) else 'copy'
+            resolution = await self.resolve_conflict_with_counter(source_file, dest_path, is_file, i+1, total_conflicts)
+            
+            if resolution == "skip":
+                logger.info(f"Skipped {operation} of {source_file.name}")
+                continue
+                
+            elif resolution == "replace":
+                # Заменяем существующий файл
+                logger.info(f"Replacing existing file: {dest_path}")
+                
+                # Выполняем перемещение или копирование
+                try:
+                    if operation == 'move':
+                        await asyncio.to_thread(shutil.move, source_file, dest_path)
+                        logger.info(f"Moved {source_file.name} to {dest_path}")
+                    else:
+                        await asyncio.to_thread(shutil.copy2, source_file, dest_path)
+                        logger.info(f"Copied {source_file.name} to {dest_path}")
+                except Exception as e:
+                    logger.error(f"Error during {operation} for {source_file.name}: {str(e)}")
+                    
+            else:  # rename
+                # Создаем уникальное имя с суффиксом
+                counter = 1
+                stem = dest_path.stem
+                suffix = dest_path.suffix
+                parent = dest_path.parent
+                
+                while True:
+                    new_name = f"{stem}_{counter}{suffix}"
+                    new_path = parent / new_name
+                    if not await asyncio.to_thread(lambda: new_path.exists()):
+                        # Выполняем перемещение или копирование с новым именем
+                        try:
+                            if operation == 'move':
+                                await asyncio.to_thread(shutil.move, source_file, new_path)
+                                logger.info(f"Moved {source_file.name} to {new_path}")
+                            else:
+                                await asyncio.to_thread(shutil.copy2, source_file, new_path)
+                                logger.info(f"Copied {source_file.name} to {new_path}")
+                        except Exception as e:
+                            logger.error(f"Error during {operation} for {source_file.name}: {str(e)}")
+                        break
+                    counter += 1
+    
+    async def resolve_conflict_with_counter(self, source_path, dest_path, is_file=True, current=1, total=1):
+        """
+        Асинхронно разрешает конфликт файлов/папок через GUI с отображением счётчика
+        """
+        global FILE_CONFLICT_ACTION, FOLDER_CONFLICT_ACTION, APPLY_TO_ALL_FILES, APPLY_TO_ALL_FOLDERS
+        
+        # Проверяем, есть ли уже решение для всех файлов/папок
+        if is_file and APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
+            logger.info(f"Using saved file conflict action: {FILE_CONFLICT_ACTION}")
+            return FILE_CONFLICT_ACTION
+        elif not is_file and APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
+            logger.info(f"Using saved folder conflict action: {FOLDER_CONFLICT_ACTION}")
+            return FOLDER_CONFLICT_ACTION
+            
+        # Сбрасываем предыдущее состояние
+        self.conflict_resolved.clear()
+        self.conflict_result = None
+        
+        # Запрашиваем решение через GUI
+        future = asyncio.get_running_loop().run_in_executor(
+            None, 
+            lambda: self.show_conflict_dialog_with_counter(source_path, dest_path, is_file, current, total)
+        )
+        
+        # Ждем результата из GUI
+        action = await future
+        
+        # Сохраняем действие для всех файлов/папок, если указано
+        if is_file and APPLY_TO_ALL_FILES:
+            FILE_CONFLICT_ACTION = action
+        elif not is_file and APPLY_TO_ALL_FOLDERS:
+            FOLDER_CONFLICT_ACTION = action
+            
+        logger.info(f"Conflict resolution for {source_path.name}: {action}")
+        return action
+    
+    def show_conflict_dialog_with_counter(self, source_path, dest_path, is_file=True, current=1, total=1):
+        """
+        Показывает диалог конфликта в синхронном режиме с указанием номера конфликта
+        """
+        global APPLY_TO_ALL_FILES, APPLY_TO_ALL_FOLDERS
+        
+        # Переменные для хранения результата
+        result = {"action": "skip"}  # По умолчанию - пропустить
+        
+        # Создаем диалоговое окно
+        dialog = tk.Toplevel(self)
+        dialog.title("Конфлікт " + ("файлів" if is_file else "папок"))
+        dialog.geometry("450x280")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()  # Диалог модальный
+        
+        # Радио-кнопки и флажок
+        action_var = tk.StringVar(value="rename")
+        apply_all_var = tk.BooleanVar(value=False)
+        
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Показываем счётчик конфликтов
+        counter_text = f"Конфлікт {current} з {total}"
+        ttk.Label(frame, text=counter_text, font=("", 10, "bold")).pack(pady=(0, 10))
+        
+        entity_type = "Файл" if is_file else "Папка"
+        msg = f'{entity_type} "{source_path.name}" вже існує у папці призначення.'
+        ttk.Label(frame, text=msg, wraplength=400).pack(pady=(0, 10))
+        
+        ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
+        ttk.Radiobutton(frame, text="Замінити існуючий", variable=action_var, value="replace").pack(anchor=tk.W)
+        ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
+        
+        apply_text = "Застосувати до всіх конфліктів " + ("файлів" if is_file else "папок") 
+        ttk.Checkbutton(frame, text=apply_text, variable=apply_all_var).pack(pady=10, anchor=tk.W)
+        
+        def on_ok():
+            # Сохраняем выбранное действие
+            result["action"] = action_var.get()
+            
+            # Обновляем глобальные настройки
+            if is_file:
+                global APPLY_TO_ALL_FILES, FILE_CONFLICT_ACTION
+                APPLY_TO_ALL_FILES = apply_all_var.get()
+                if APPLY_TO_ALL_FILES:
+                    FILE_CONFLICT_ACTION = result["action"]
+            else:
+                global APPLY_TO_ALL_FOLDERS, FOLDER_CONFLICT_ACTION
+                APPLY_TO_ALL_FOLDERS = apply_all_var.get()
+                if APPLY_TO_ALL_FOLDERS:
+                    FOLDER_CONFLICT_ACTION = result["action"]
+                    
+            # Закрываем диалог
+            dialog.destroy()
+        
+        def on_cancel():
+            # При отмене - пропускаем файл
+            result["action"] = "skip"
+            dialog.destroy()
+        
+        # Кнопки
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        
+        # При закрытии окна - пропускаем файл
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        
+        # Центрирование диалога
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f'+{x}+{y}')
+        
+        # Поднимаем диалог на передний план и блокируем основное окно
+        dialog.lift()
+        dialog.focus_force()
+        
+        # Ждем закрытия диалога (блокирующий вызов)
+        self.wait_window(dialog)
+        
+        # Возвращаем результат
+        return result["action"]
+    
     def _reset_sorting_state(self):
         """
         Сбрасывает состояние сортировки
@@ -624,9 +833,17 @@ class SortHubApp(tk.Tk):
                     logger.info(f"Skipping identical file {source_file.name}")
                     return
                 
-                # Получаем решение пользователя о конфликте
-                logger.info(f"Conflict detected for {source_file.name}, getting resolution...")
-                resolution = await self.resolve_conflict(source_file, dest_path, True)
+                # Проверяем, есть ли уже глобальное решение для всех файлов
+                global APPLY_TO_ALL_FILES, FILE_CONFLICT_ACTION
+                if APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
+                    logger.info(f"Using saved file conflict action: {FILE_CONFLICT_ACTION}")
+                    resolution = FILE_CONFLICT_ACTION
+                else:
+                    # Добавляем в список ожидающих разрешения конфликтов
+                    logger.info(f"Adding conflict for {source_file.name} to pending list")
+                    self.pending_conflicts.append((source_file, dest_path, True))
+                    self.pending_operations.append('move')
+                    return
                 
                 if resolution == "skip":
                     logger.info(f"Skipped moving {source_file.name}")
@@ -684,9 +901,17 @@ class SortHubApp(tk.Tk):
                     logger.info(f"Skipping identical file {source_file.name}")
                     return
                 
-                # Получаем решение пользователя о конфликте
-                logger.info(f"Conflict detected for {source_file.name}, getting resolution...")
-                resolution = await self.resolve_conflict(source_file, dest_path, True)
+                # Проверяем, есть ли уже глобальное решение для всех файлов
+                global APPLY_TO_ALL_FILES, FILE_CONFLICT_ACTION
+                if APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
+                    logger.info(f"Using saved file conflict action: {FILE_CONFLICT_ACTION}")
+                    resolution = FILE_CONFLICT_ACTION
+                else:
+                    # Добавляем в список ожидающих разрешения конфликтов
+                    logger.info(f"Adding conflict for {source_file.name} to pending list")
+                    self.pending_conflicts.append((source_file, dest_path, True))
+                    self.pending_operations.append('copy')
+                    return
                 
                 if resolution == "skip":
                     logger.info(f"Skipped copying {source_file.name}")
