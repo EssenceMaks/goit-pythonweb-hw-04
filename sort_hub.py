@@ -12,6 +12,7 @@ import queue
 import threading
 import signal
 import sys
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +32,9 @@ async_gui_queue = queue.Queue()
 
 # Список активных потоков для корректного завершения
 active_threads = []
+
+# Создаем глобальный ThreadPoolExecutor для запуска блокирующих операций
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 def run_in_background(func):
     """
@@ -133,8 +137,12 @@ class SortHubApp(tk.Tk):
         
         # Для управления асинхронными задачами
         self.sorting_in_progress = False
-        self.conflict_resolved = asyncio.Event()
-        self.conflict_resolution_result = None
+        self.should_cancel = False
+        self.is_sorting = False
+        
+        # События для разрешения конфликтов
+        self.conflict_result = None
+        self.conflict_resolved = threading.Event()
         
         self.create_widgets()
         
@@ -250,10 +258,6 @@ class SortHubApp(tk.Tk):
             state=tk.DISABLED
         )
         self.copy_button.pack(side=tk.RIGHT, padx=5)
-        
-        # Флаг для отслеживания процесса сортировки
-        self.is_sorting = False
-        self.should_cancel = False
 
     def check_async_messages(self):
         """
@@ -279,26 +283,6 @@ class SortHubApp(tk.Tk):
                     files = message.get('files', [])
                     folders = message.get('folders', [])
                     self._show_analysis_results(extensions, files, folders)
-                    
-                elif action == 'request_resolution':
-                    # Новый обработчик для запросов разрешения конфликтов
-                    is_file = message.get('is_file', True)
-                    source_path = message.get('source_path', '')
-                    dest_path = message.get('dest_path', '')
-                    future = message.get('future')
-                    
-                    if future and not future.done():  # Проверяем, не завершен ли уже future
-                        try:
-                            if is_file:
-                                result = self._handle_file_conflict_sync(Path(source_path), Path(dest_path))
-                            else:
-                                result = self._handle_folder_conflict_sync(Path(source_path), Path(dest_path))
-                            if not future.done():  # Проверяем еще раз перед установкой результата
-                                future.set_result(result)
-                        except Exception as e:
-                            logger.error(f"Error handling conflict resolution: {str(e)}")
-                            if not future.done():
-                                future.set_result("skip")  # В случае ошибки пропускаем файл
                 
         except queue.Empty:
             pass
@@ -470,7 +454,8 @@ class SortHubApp(tk.Tk):
         self.move_button.config(state=tk.DISABLED)
         self.copy_button.config(state=tk.DISABLED)
         self.cancel_button.config(state=tk.NORMAL)
-        self.update()
+        self.is_sorting = True
+        self.should_cancel = False
         
         # Сбрасываем глобальные настройки разрешения конфликтов
         global FILE_CONFLICT_ACTION, FOLDER_CONFLICT_ACTION, APPLY_TO_ALL_FILES, APPLY_TO_ALL_FOLDERS
@@ -478,10 +463,6 @@ class SortHubApp(tk.Tk):
         FOLDER_CONFLICT_ACTION = None
         APPLY_TO_ALL_FILES = False
         APPLY_TO_ALL_FOLDERS = False
-        
-        # Устанавливаем флаги сортировки
-        self.is_sorting = True
-        self.should_cancel = False
         
         # Запускаем асинхронную сортировку
         run_in_background(self._run_sorting_async)(
@@ -496,10 +477,6 @@ class SortHubApp(tk.Tk):
         Запускает асинхронную сортировку файлов
         """
         try:
-            # Устанавливаем флаг начала сортировки
-            # Этот вызов должен выполняться в GUI-потоке
-            self.after(0, lambda: self._update_sorting_status(True))
-            
             # Создаем целевую папку, если она не существует
             os.makedirs(self.dest_folder, exist_ok=True)
             
@@ -522,6 +499,7 @@ class SortHubApp(tk.Tk):
                 if self.should_cancel:
                     logger.info("Sorting process was cancelled by the user.")
                     break
+                    
                 ext = file.suffix.lower()[1:] or 'no_extension'
                 # Обрабатываем только файлы с выбранными расширениями
                 if ext in selected_extensions:
@@ -536,6 +514,7 @@ class SortHubApp(tk.Tk):
                     if self.should_cancel:
                         logger.info("Sorting process was cancelled by the user.")
                         break
+                        
                     # Пропускаем папки, которые могут вызвать рекурсию
                     if str(self.dest_folder).startswith(str(folder)):
                         logger.warning(f"Skipping folder {folder.name} to avoid recursion")
@@ -561,29 +540,18 @@ class SortHubApp(tk.Tk):
                 'error': f"Помилка під час сортування: {str(e)}"
             })
         finally:
-            # Гарантированно сбрасываем состояние сортировки при любом исходе
-            # Этот вызов должен выполняться в GUI-потоке
-            self.after(0, lambda: self._update_sorting_status(False))
+            # Гарантированно сбрасываем состояние сортировки
+            self.after(0, self._reset_sorting_state)
             
-    def _update_sorting_status(self, is_active):
+    def _reset_sorting_state(self):
         """
-        Обновляет состояние интерфейса во время сортировки
+        Сбрасывает состояние сортировки
         """
-        self.is_sorting = is_active
-        if is_active:
-            self.move_button.config(state=tk.DISABLED)
-            self.copy_button.config(state=tk.DISABLED)
-            self.cancel_button.config(state=tk.NORMAL)
-        else:
-            self.move_button.config(state=tk.NORMAL)
-            self.copy_button.config(state=tk.NORMAL)
-            self.cancel_button.config(state=tk.DISABLED)
-            if not self.should_cancel:
-                # Если процесс не был отменен пользователем, обновляем статус
-                self.status_label.config(text="Сортування завершено")
-            else:
-                self.should_cancel = False  # Сбрасываем флаг отмены
-    
+        self.is_sorting = False
+        self.move_button.config(state=tk.NORMAL)
+        self.copy_button.config(state=tk.NORMAL)
+        self.cancel_button.config(state=tk.DISABLED)
+        
     def cancel_sorting(self):
         """
         Прерывает процесс сортировки
@@ -591,21 +559,10 @@ class SortHubApp(tk.Tk):
         if self.is_sorting:
             self.should_cancel = True
             self.status_label.config(text="Сортування зупинено користувачем.")
-            # Разблокируем кнопки сортировки
-            self._enable_buttons()
-            # Заблокируем кнопку отмены
-            self.cancel_button.config(state=tk.DISABLED)
+            self._reset_sorting_state()
             
             # Сообщение пользователю
             messagebox.showinfo("Інформація", "Процес сортування буде зупинено після завершення поточної операції.")
-    
-    def _enable_buttons(self):
-        """
-        Включает кнопки сортировки
-        """
-        self.move_button.config(state=tk.NORMAL)
-        self.copy_button.config(state=tk.NORMAL)
-        self.is_sorting = False
     
     def on_closing(self):
         """
@@ -616,6 +573,9 @@ class SortHubApp(tk.Tk):
             
             # Завершаем все активные потоки
             self.terminate_threads()
+            
+            # Завершаем пул потоков
+            thread_pool.shutdown(wait=False)
             
             # Закрываем приложение
             self.destroy()
@@ -664,9 +624,9 @@ class SortHubApp(tk.Tk):
                     logger.info(f"Skipping identical file {source_file.name}")
                     return
                 
-                # Получаем новый путь или None, если нужно пропустить
+                # Получаем решение пользователя о конфликте
                 logger.info(f"Conflict detected for {source_file.name}, getting resolution...")
-                resolution = await self._resolve_conflict(source_file, dest_path, True)
+                resolution = await self.resolve_conflict(source_file, dest_path, True)
                 
                 if resolution == "skip":
                     logger.info(f"Skipped moving {source_file.name}")
@@ -674,7 +634,7 @@ class SortHubApp(tk.Tk):
                 elif resolution == "replace":
                     # Используем существующий путь
                     logger.info(f"Replacing existing file: {dest_path}")
-                else:
+                else:  # rename
                     # Для переименования создаем новый путь с суффиксом
                     counter = 1
                     stem = dest_path.stem
@@ -684,7 +644,7 @@ class SortHubApp(tk.Tk):
                     while True:
                         new_name = f"{stem}_{counter}{suffix}"
                         new_path = parent / new_name
-                        if not new_path.exists():
+                        if not await asyncio.to_thread(lambda: new_path.exists()):
                             dest_path = new_path
                             logger.info(f"File renamed to: {dest_path}")
                             break
@@ -724,9 +684,9 @@ class SortHubApp(tk.Tk):
                     logger.info(f"Skipping identical file {source_file.name}")
                     return
                 
-                # Получаем решение о способе разрешения конфликта
+                # Получаем решение пользователя о конфликте
                 logger.info(f"Conflict detected for {source_file.name}, getting resolution...")
-                resolution = await self._resolve_conflict(source_file, dest_path, True)
+                resolution = await self.resolve_conflict(source_file, dest_path, True)
                 
                 if resolution == "skip":
                     logger.info(f"Skipped copying {source_file.name}")
@@ -734,7 +694,7 @@ class SortHubApp(tk.Tk):
                 elif resolution == "replace":
                     # Используем существующий путь
                     logger.info(f"Replacing existing file: {dest_path}")
-                else:
+                else:  # rename
                     # Для переименования создаем новый путь с суффиксом
                     counter = 1
                     stem = dest_path.stem
@@ -744,7 +704,7 @@ class SortHubApp(tk.Tk):
                     while True:
                         new_name = f"{stem}_{counter}{suffix}"
                         new_path = parent / new_name
-                        if not new_path.exists():
+                        if not await asyncio.to_thread(lambda: new_path.exists()):
                             dest_path = new_path
                             logger.info(f"File renamed to: {dest_path}")
                             break
@@ -782,15 +742,30 @@ class SortHubApp(tk.Tk):
             
             # Проверяем конфликт имен папок
             if await asyncio.to_thread(dest_path.exists):
-                dest_path = await self._resolve_conflict(source_folder, dest_path, False)
+                # Получаем решение пользователя о конфликте
+                resolution = await self.resolve_conflict(source_folder, dest_path, False)
                 
-                if dest_path is None:
+                if resolution == "skip":
                     logger.info(f"Skipped moving folder {source_folder.name}")
                     return
-                
-                # Если нужно заменить существующую папку
-                if await asyncio.to_thread(dest_path.exists) and dest_path != source_folder:
-                    await asyncio.to_thread(shutil.rmtree, dest_path)
+                elif resolution == "replace":
+                    # Если нужно заменить существующую папку
+                    if await asyncio.to_thread(dest_path.exists) and dest_path != source_folder:
+                        await asyncio.to_thread(shutil.rmtree, dest_path)
+                else:  # rename
+                    # Для переименования создаем новый путь с суффиксом
+                    counter = 1
+                    name = dest_path.name
+                    parent = dest_path.parent
+                    
+                    while True:
+                        new_name = f"{name}_{counter}"
+                        new_path = parent / new_name
+                        if not await asyncio.to_thread(lambda: new_path.exists()):
+                            dest_path = new_path
+                            logger.info(f"Folder renamed to: {dest_path}")
+                            break
+                        counter += 1
             
             # Перемещаем папку
             if source_folder != dest_path:
@@ -827,15 +802,30 @@ class SortHubApp(tk.Tk):
             
             # Проверяем конфликт имен папок
             if await asyncio.to_thread(dest_path.exists):
-                dest_path = await self._resolve_conflict(source_folder, dest_path, False)
+                # Получаем решение пользователя о конфликте
+                resolution = await self.resolve_conflict(source_folder, dest_path, False)
                 
-                if dest_path is None:
+                if resolution == "skip":
                     logger.info(f"Skipped copying folder {source_folder.name}")
                     return
-                
-                # Если нужно заменить существующую папку
-                if await asyncio.to_thread(dest_path.exists):
-                    await asyncio.to_thread(shutil.rmtree, dest_path)
+                elif resolution == "replace":
+                    # Если нужно заменить существующую папку
+                    if await asyncio.to_thread(dest_path.exists):
+                        await asyncio.to_thread(shutil.rmtree, dest_path)
+                else:  # rename
+                    # Для переименования создаем новый путь с суффиксом
+                    counter = 1
+                    name = dest_path.name
+                    parent = dest_path.parent
+                    
+                    while True:
+                        new_name = f"{name}_{counter}"
+                        new_path = parent / new_name
+                        if not await asyncio.to_thread(lambda: new_path.exists()):
+                            dest_path = new_path
+                            logger.info(f"Folder renamed to: {dest_path}")
+                            break
+                        counter += 1
             
             # Копируем папку
             await asyncio.to_thread(shutil.copytree, source_folder, dest_path)
@@ -844,55 +834,128 @@ class SortHubApp(tk.Tk):
         except Exception as e:
             logger.error(f"Error copying folder {source_folder}: {str(e)}")
     
-    async def _resolve_conflict(self, source_path, dest_path, is_file=True):
+    async def resolve_conflict(self, source_path, dest_path, is_file=True):
         """
         Асинхронно разрешает конфликт файлов/папок через GUI
-        Возвращает "skip", "replace" или "rename" в зависимости от выбора пользователя
         """
         global FILE_CONFLICT_ACTION, FOLDER_CONFLICT_ACTION, APPLY_TO_ALL_FILES, APPLY_TO_ALL_FOLDERS
         
         # Проверяем, есть ли уже решение для всех файлов/папок
         if is_file and APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
-            logger.info(f"Using saved file conflict resolution for {source_path.name}: {FILE_CONFLICT_ACTION}")
+            logger.info(f"Using saved file conflict action: {FILE_CONFLICT_ACTION}")
             return FILE_CONFLICT_ACTION
         elif not is_file and APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
-            logger.info(f"Using saved folder conflict resolution for {source_path.name}: {FOLDER_CONFLICT_ACTION}")
+            logger.info(f"Using saved folder conflict action: {FOLDER_CONFLICT_ACTION}")
             return FOLDER_CONFLICT_ACTION
+            
+        # Сбрасываем предыдущее состояние
+        self.conflict_resolved.clear()
+        self.conflict_result = None
         
-        # Отправляем запрос в GUI поток через очередь сообщений
-        future = asyncio.Future()
-        request_data = {
-            'action': 'request_resolution',
-            'is_file': is_file,
-            'source_path': str(source_path),
-            'dest_path': str(dest_path),
-            'future': future,
-            'priority': True  # Помечаем как приоритетное сообщение
-        }
+        # Запрашиваем решение через GUI
+        future = asyncio.get_running_loop().run_in_executor(
+            None, 
+            lambda: self.show_conflict_dialog_sync(source_path, dest_path, is_file)
+        )
         
-        # Добавляем в очередь сообщений для обработки в основном потоке
-        async_gui_queue.put(request_data)
-        
-        # Ждем результата от GUI потока
-        try:
-            action = await asyncio.wait_for(future, timeout=10.0)  # Увеличиваем таймаут до 10 секунд
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout waiting for conflict resolution for {source_path.name}")
-            return "skip"
-        except Exception as e:
-            logger.error(f"Error during conflict resolution for {source_path.name}: {str(e)}")
-            return "skip"
+        # Ждем результата из GUI
+        action = await future
         
         # Сохраняем действие для всех файлов/папок, если указано
         if is_file and APPLY_TO_ALL_FILES:
             FILE_CONFLICT_ACTION = action
-            logger.info(f"Saved file conflict action for all files: {action}")
         elif not is_file and APPLY_TO_ALL_FOLDERS:
             FOLDER_CONFLICT_ACTION = action
-            logger.info(f"Saved folder conflict action for all folders: {action}")
-        
+            
         logger.info(f"Conflict resolution for {source_path.name}: {action}")
         return action
+    
+    def show_conflict_dialog_sync(self, source_path, dest_path, is_file=True):
+        """
+        Показывает диалог конфликта в синхронном режиме
+        """
+        global APPLY_TO_ALL_FILES, APPLY_TO_ALL_FOLDERS
+        
+        # Переменные для хранения результата
+        result = {"action": "skip"}  # По умолчанию - пропустить
+        
+        # Создаем диалоговое окно
+        dialog = tk.Toplevel(self)
+        dialog.title("Конфлікт " + ("файлів" if is_file else "папок"))
+        dialog.geometry("450x250")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()  # Диалог модальный
+        
+        # Радио-кнопки и флажок
+        action_var = tk.StringVar(value="rename")
+        apply_all_var = tk.BooleanVar(value=False)
+        
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        entity_type = "Файл" if is_file else "Папка"
+        msg = f'{entity_type} "{source_path.name}" вже існує у папці призначення.'
+        ttk.Label(frame, text=msg, wraplength=400).pack(pady=(0, 10))
+        
+        ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
+        ttk.Radiobutton(frame, text="Замінити існуючий", variable=action_var, value="replace").pack(anchor=tk.W)
+        ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
+        
+        apply_text = "Застосувати до всіх конфліктів " + ("файлів" if is_file else "папок") 
+        ttk.Checkbutton(frame, text=apply_text, variable=apply_all_var).pack(pady=10, anchor=tk.W)
+        
+        def on_ok():
+            # Сохраняем выбранное действие
+            result["action"] = action_var.get()
+            
+            # Обновляем глобальные настройки
+            if is_file:
+                global APPLY_TO_ALL_FILES, FILE_CONFLICT_ACTION
+                APPLY_TO_ALL_FILES = apply_all_var.get()
+                if APPLY_TO_ALL_FILES:
+                    FILE_CONFLICT_ACTION = result["action"]
+            else:
+                global APPLY_TO_ALL_FOLDERS, FOLDER_CONFLICT_ACTION
+                APPLY_TO_ALL_FOLDERS = apply_all_var.get()
+                if APPLY_TO_ALL_FOLDERS:
+                    FOLDER_CONFLICT_ACTION = result["action"]
+                    
+            # Закрываем диалог
+            dialog.destroy()
+        
+        def on_cancel():
+            # При отмене - пропускаем файл
+            result["action"] = "skip"
+            dialog.destroy()
+        
+        # Кнопки
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
+        
+        # При закрытии окна - пропускаем файл
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        
+        # Центрирование диалога
+        dialog.update_idletasks()
+        width = dialog.winfo_width()
+        height = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (dialog.winfo_screenheight() // 2) - (height // 2)
+        dialog.geometry(f'+{x}+{y}')
+        
+        # Поднимаем диалог на передний план и блокируем основное окно
+        dialog.lift()
+        dialog.focus_force()
+        
+        # Ждем закрытия диалога (блокирующий вызов)
+        self.wait_window(dialog)
+        
+        # Возвращаем результат
+        return result["action"]
     
     async def _is_same_file(self, file1: Path, file2: Path):
         """
@@ -913,179 +976,13 @@ class SortHubApp(tk.Tk):
             # В случае ошибки считаем, что это разные файлы
             return False
     
-    def _handle_file_conflict_sync(self, source_file, dest_path):
-        """
-        Обрабатывает конфликт файлов и возвращает решение
-        """
-        global FILE_CONFLICT_ACTION, APPLY_TO_ALL_FILES
-        
-        if APPLY_TO_ALL_FILES and FILE_CONFLICT_ACTION:
-            action = FILE_CONFLICT_ACTION
-        else:
-            dialog = tk.Toplevel(self)
-            dialog.title("Конфлікт файлів")
-            dialog.geometry("450x250")
-            dialog.resizable(False, False)
-            dialog.transient(self)
-            dialog.grab_set()
-            
-            action_var = tk.StringVar(value="rename")
-            apply_all_var = tk.BooleanVar(value=False)
-            
-            frame = ttk.Frame(dialog, padding="20")
-            frame.pack(fill=tk.BOTH, expand=True)
-            
-            msg = f'Файл "{source_file.name}" вже існує у папці призначення.'
-            ttk.Label(frame, text=msg, wraplength=400).pack(pady=(0, 10))
-            
-            ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
-            ttk.Radiobutton(frame, text="Замінити існуючий", variable=action_var, value="replace").pack(anchor=tk.W)
-            ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
-            
-            ttk.Checkbutton(frame, text="Застосувати до всіх конфліктів файлів", variable=apply_all_var).pack(pady=10, anchor=tk.W)
-            
-            result = {"action": None}
-            
-            def on_ok():
-                result["action"] = action_var.get()
-                global APPLY_TO_ALL_FILES, FILE_CONFLICT_ACTION
-                APPLY_TO_ALL_FILES = apply_all_var.get()
-                if APPLY_TO_ALL_FILES:
-                    FILE_CONFLICT_ACTION = result["action"]
-                dialog.destroy()
-                
-            def on_cancel():
-                result["action"] = "skip"
-                dialog.destroy()
-            
-            btn_frame = ttk.Frame(frame)
-            btn_frame.pack(fill=tk.X, pady=10)
-            
-            ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
-            ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
-            
-            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-            
-            # Центрируем диалог
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-            y = (dialog.winfo_screenheight() // 2) - (height // 2)
-            dialog.geometry(f'+{x}+{y}')
-            
-            # Поднимаем диалог на передний план
-            dialog.lift()
-            dialog.focus_force()
-            
-            # Ждем закрытия диалога
-            self.wait_window(dialog)
-            
-            action = result["action"]
-        
-        if action == "replace":
-            return "replace"
-        elif action == "rename":
-            return "rename"
-        else:  # skip
-            return "skip"
-    
-    def _handle_folder_conflict_sync(self, source_folder, dest_path):
-        """
-        Обрабатывает конфликт папок и возвращает решение
-        """
-        global FOLDER_CONFLICT_ACTION, APPLY_TO_ALL_FOLDERS
-        
-        if APPLY_TO_ALL_FOLDERS and FOLDER_CONFLICT_ACTION:
-            action = FOLDER_CONFLICT_ACTION
-        else:
-            dialog = tk.Toplevel(self)
-            dialog.title("Конфлікт папок")
-            dialog.geometry("450x250")
-            dialog.resizable(False, False)
-            dialog.transient(self)
-            dialog.grab_set()
-            
-            action_var = tk.StringVar(value="rename")
-            apply_all_var = tk.BooleanVar(value=False)
-            
-            frame = ttk.Frame(dialog, padding="20")
-            frame.pack(fill=tk.BOTH, expand=True)
-            
-            msg = f'Папка "{source_folder.name}" вже існує у папці призначення.'
-            ttk.Label(frame, text=msg, wraplength=400).pack(pady=(0, 10))
-            
-            ttk.Radiobutton(frame, text="Перейменувати (додати номер)", variable=action_var, value="rename").pack(anchor=tk.W)
-            ttk.Radiobutton(frame, text="Замінити існуючу", variable=action_var, value="replace").pack(anchor=tk.W)
-            ttk.Radiobutton(frame, text="Пропустити", variable=action_var, value="skip").pack(anchor=tk.W)
-            
-            ttk.Checkbutton(frame, text="Застосувати до всіх конфліктів папок", variable=apply_all_var).pack(pady=10, anchor=tk.W)
-            
-            result = {"action": None}
-            
-            def on_ok():
-                result["action"] = action_var.get()
-                global APPLY_TO_ALL_FOLDERS, FOLDER_CONFLICT_ACTION
-                APPLY_TO_ALL_FOLDERS = apply_all_var.get()
-                if APPLY_TO_ALL_FOLDERS:
-                    FOLDER_CONFLICT_ACTION = result["action"]
-                dialog.destroy()
-                
-            def on_cancel():
-                result["action"] = "skip"
-                dialog.destroy()
-            
-            btn_frame = ttk.Frame(frame)
-            btn_frame.pack(fill=tk.X, pady=10)
-            
-            ttk.Button(btn_frame, text="Скасувати", command=on_cancel).pack(side=tk.LEFT)
-            ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
-            
-            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-            
-            # Центрируем диалог
-            dialog.update_idletasks()
-            width = dialog.winfo_width()
-            height = dialog.winfo_height()
-            x = (dialog.winfo_screenwidth() // 2) - (width // 2)
-            y = (dialog.winfo_screenheight() // 2) - (height // 2)
-            dialog.geometry(f'+{x}+{y}')
-            
-            # Поднимаем диалог на передний план
-            dialog.lift()
-            dialog.focus_force()
-            
-            # Ждем закрытия диалога
-            self.wait_window(dialog)
-            
-            action = result["action"]
-        
-        if action == "replace":
-            return "replace"
-        elif action == "rename":
-            return "rename"
-        else:  # skip
-            return "skip"
-    
-    def _handle_file_conflict_gui(self, source_file, dest_path):
-        """
-        Устаревший метод - оставлен для совместимости
-        """
-        pass
-    
-    def _handle_folder_conflict_gui(self, source_folder, dest_path):
-        """
-        Устаревший метод - оставлен для совместимости
-        """
-        pass
-    
     def _show_completion_dialog(self, action_name):
         """
         Показывает диалог завершения
         """
         if self.should_cancel:
             self.status_label.config(text="Сортування зупинено користувачем.")
-            self._enable_buttons()
+            self._reset_sorting_state()
             return
             
         self.status_label.config(text=f"Сортування завершено. Файли {action_name}.")
@@ -1095,7 +992,7 @@ class SortHubApp(tk.Tk):
         completion_window.geometry("300x150")
         completion_window.resizable(False, False)
         completion_window.transient(self)
-        completion_window.grab_set()  # Блокируем взаимодействие с основным окном
+        completion_window.grab_set()
         
         frame = ttk.Frame(completion_window, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -1121,7 +1018,7 @@ class SortHubApp(tk.Tk):
             command=completion_window.destroy
         ).pack(side=tk.RIGHT, padx=5)
         
-        # Центрирование окна
+        # Центрируем диалог
         completion_window.update_idletasks()
         width = completion_window.winfo_width()
         height = completion_window.winfo_height()
@@ -1129,12 +1026,8 @@ class SortHubApp(tk.Tk):
         y = (completion_window.winfo_screenheight() // 2) - (height // 2)
         completion_window.geometry(f'+{x}+{y}')
         
-        # Поднимаем диалог на передний план
-        completion_window.lift()
         completion_window.focus_force()
-        
-        # Включаем кнопки сортировки
-        self._enable_buttons()
+        self._reset_sorting_state()
     
     def _open_dest_folder(self):
         """
